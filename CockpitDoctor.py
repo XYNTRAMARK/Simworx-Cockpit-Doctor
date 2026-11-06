@@ -32,7 +32,7 @@ def entries(payload):
 class Doctor(tk.Tk):
     def __init__(self):
         super().__init__()
-        self.title("SIMWORX | Cockpit Doctor v0.3")
+        self.title("SIMWORX | Cockpit Doctor v0.4")
         self.geometry("1170x720")
         self.configure(bg="#142235")
         self.rows = []
@@ -43,6 +43,8 @@ class Doctor(tk.Tk):
         self.scan_ok = False
         self.busy = False
         self.bench = None
+        self.monitor = None
+        self.ref_ids = {}
 
         tk.Label(self, text="SIMWORX / COCKPIT DOCTOR", bg="#142235", fg="white",
                  font=("Segoe UI", 20, "bold")).pack(anchor="w", padx=14, pady=(12, 3))
@@ -58,6 +60,7 @@ class Doctor(tk.Tk):
             ("Export audit CSV", self.export_audit),
             ("Export live JSON", self.export_live),
             ("5 LIVE TEST BENCH", self.open_bench),
+            ("6 WATCH DATAREFS", self.open_monitor),
         ]
         for label, action in actions:
             tk.Button(toolbar, text=label, command=action, bg="#254668", fg="white",
@@ -214,19 +217,23 @@ class Doctor(tk.Tk):
             raw_cmds = entries(web_json(API + "commands"))
             refs = sorted({i["name"] for i in raw_refs if isinstance(i, dict) and i.get("name")})
             cmds = sorted({i["name"] for i in raw_cmds if isinstance(i, dict) and i.get("name")})
+            ref_ids = {i["name"]: i["id"] for i in raw_refs if isinstance(i, dict) and
+                       i.get("name") and isinstance(i.get("id"), int)}
             ids = {i["name"]: i["id"] for i in raw_cmds if isinstance(i, dict) and
                    i.get("name") and isinstance(i.get("id"), int)}
-            self.after(0, lambda: self._scan_success(refs, cmds, ids))
+            self.after(0, lambda: self._scan_success(refs, cmds, ids, ref_ids))
         except Exception as error:
             text = str(error)
             self.after(0, lambda: self._scan_failure(text))
 
-    def _scan_success(self, refs, cmds, ids):
+    def _scan_success(self, refs, cmds, ids, ref_ids):
         self.busy = False
         self.datarefs, self.commands, self.command_ids = refs, cmds, ids
+        self.ref_ids = ref_ids
         self.scan_ok = True
         self.refresh_status()
         self.update_bench()
+        self.update_monitor_list()
         messagebox.showinfo("X-Plane scan", f"Found {len(refs)} DataRefs and "
                             f"{len(cmds)} commands. Open LIVE TEST BENCH to browse them.")
 
@@ -259,6 +266,107 @@ class Doctor(tk.Tk):
         Path(path).write_text(json.dumps({"source": API, "datarefs": self.datarefs,
                                          "commands": self.commands}, indent=2), encoding="utf-8")
         messagebox.showinfo("Exported", "Live inventory saved.")
+
+
+    def open_monitor(self):
+        """Read-only X-Plane DataRef monitor for comparing cockpit switch states."""
+        if self.monitor and self.monitor.winfo_exists():
+            self.monitor.lift()
+            return
+        self.monitor = tk.Toplevel(self)
+        self.monitor.title("SIMWORX | DataRef State Monitor (read-only)")
+        self.monitor.geometry("960x650")
+        tk.Label(self.monitor, text="READ-ONLY DATAREF MONITOR",
+                 font=("Segoe UI", 17, "bold")).pack(anchor="w", padx=12, pady=10)
+        tk.Label(self.monitor, text="Choose a DataRef, record the initial value, operate ONE cockpit switch, then read again. No aircraft values are written.").pack(anchor="w", padx=12)
+        bar = tk.Frame(self.monitor)
+        bar.pack(fill="x", padx=12, pady=10)
+        tk.Label(bar, text="Find:").pack(side="left")
+        self.ref_query = tk.StringVar(value="aerobask/eng/sw_ecu_test")
+        self.ref_query.trace_add("write", lambda *_: self.update_monitor_list())
+        tk.Entry(bar, textvariable=self.ref_query, width=46).pack(side="left", padx=8)
+        tk.Button(bar, text="Refresh X-Plane inventory", command=self.scan).pack(side="left")
+        self.ref_matches = tk.StringVar()
+        tk.Label(bar, textvariable=self.ref_matches).pack(side="left", padx=8)
+        holder = tk.Frame(self.monitor)
+        holder.pack(fill="both", expand=True, padx=12)
+        self.ref_table = ttk.Treeview(holder, columns=("name", "id"), show="headings", height=14)
+        self.ref_table.heading("name", text="DataRef")
+        self.ref_table.heading("id", text="Current session ID")
+        self.ref_table.column("name", width=690)
+        self.ref_table.column("id", width=160)
+        scroll = ttk.Scrollbar(holder, command=self.ref_table.yview)
+        self.ref_table.configure(yscrollcommand=scroll.set)
+        self.ref_table.pack(side="left", fill="both", expand=True)
+        scroll.pack(side="right", fill="y")
+        row = tk.Frame(self.monitor)
+        row.pack(fill="x", padx=12, pady=8)
+        tk.Button(row, text="READ INITIAL VALUE", command=lambda: self.read_ref(True)).pack(side="left", padx=4)
+        tk.Button(row, text="READ AFTER SWITCH", command=lambda: self.read_ref(False)).pack(side="left", padx=4)
+        self.ref_status = tk.StringVar(value="Scan live X-Plane first, if necessary.")
+        tk.Label(self.monitor, textvariable=self.ref_status, anchor="w").pack(fill="x", padx=12)
+        self.ref_log = tk.Text(self.monitor, height=9, wrap="word")
+        self.ref_log.pack(fill="x", padx=12, pady=10)
+        self.ref_initial = {}
+        self.ref_read_busy = False
+        self.update_monitor_list()
+
+    def update_monitor_list(self):
+        if not self.monitor or not self.monitor.winfo_exists():
+            return
+        self.ref_table.delete(*self.ref_table.get_children())
+        query = self.ref_query.get().strip().lower()
+        matches = [name for name in self.datarefs if query in name.lower()]
+        for name in matches[:500]:
+            self.ref_table.insert("", "end", values=(name, self.ref_ids.get(name, "—")))
+        self.ref_matches.set(f"{len(matches)} matches (first 500 shown)")
+
+    def read_ref(self, baseline):
+        selected = self.ref_table.selection()
+        if not selected:
+            return messagebox.showinfo("Select a DataRef", "Choose a DataRef from the list.", parent=self.monitor)
+        if self.ref_read_busy or self.busy:
+            return
+        name = self.ref_table.item(selected[0], "values")[0]
+        self.ref_read_busy = True
+        self.ref_status.set(f"Reading {name} ...")
+        threading.Thread(target=self._ref_worker, args=(name, baseline), daemon=True).start()
+
+    def _ref_worker(self, name, baseline):
+        try:
+            # Resolve the ID again: X-Plane IDs should never be persisted across sessions.
+            query = urllib.parse.urlencode({"filter[name]": name})
+            candidates = entries(web_json(API + "datarefs?" + query))
+            found = [i for i in candidates if isinstance(i, dict) and
+                     i.get("name") == name and isinstance(i.get("id"), int)]
+            if len(found) != 1:
+                raise ValueError("DataRef unavailable or ambiguous; rescan X-Plane.")
+            payload = web_json(API + f"datarefs/{found[0]['id']}/value")
+            if not isinstance(payload, dict) or "data" not in payload:
+                raise ValueError("Unexpected DataRef response")
+            result = json.dumps(payload["data"], ensure_ascii=False)
+            self.after(0, lambda: self._ref_done(name, result, baseline, None))
+        except Exception as e:
+            error = str(e)
+            self.after(0, lambda: self._ref_done(name, None, baseline, error))
+
+    def _ref_done(self, name, result, baseline, error):
+        self.ref_read_busy = False
+        if not self.monitor or not self.monitor.winfo_exists():
+            return
+        if error:
+            self.ref_status.set("Read failed")
+            self.ref_log.insert("end", f"{name}: ERROR {error}\n")
+        elif baseline:
+            self.ref_initial[name] = result
+            self.ref_status.set("Initial value recorded. Operate ONE physical control, then read again.")
+            self.ref_log.insert("end", f"BEFORE  {name} = {result}\n")
+        else:
+            old = self.ref_initial.get(name)
+            change = "CHANGED" if old is not None and old != result else ("UNCHANGED" if old is not None else "NO INITIAL VALUE")
+            self.ref_status.set(f"{change}: {name}")
+            self.ref_log.insert("end", f"AFTER   {name} = {result} [{change}]\n")
+        self.ref_log.see("end")
 
     def open_bench(self):
         if self.bench and self.bench.winfo_exists():
